@@ -34,6 +34,16 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".f
 MIN_VIDEO_FPS = 30.0
 
 
+def can_use_embedded_vlc() -> bool:
+    """Return whether embedded VLC playback is safe on this platform.
+
+    On recent macOS/Python/Tk combinations, VLC's OpenGL layer can crash the
+    process from a background decode thread when bound to a Tk canvas. We avoid
+    embedded VLC playback there and fall back to a static video preview.
+    """
+    return sys.platform != "darwin"
+
+
 class MediaSorterApp:
     def __init__(self, root: tk.Tk, media_paths: list[Path], source_folder: Path) -> None:
         self.root = root
@@ -46,8 +56,9 @@ class MediaSorterApp:
         self.current_media: Path | None = None
         self.current_photo: ImageTk.PhotoImage | None = None
 
-        self.instance = vlc.Instance("--quiet")
-        self.player = self.instance.media_player_new()
+        self.vlc_enabled = can_use_embedded_vlc()
+        self.instance = vlc.Instance("--quiet") if self.vlc_enabled else None
+        self.player = self.instance.media_player_new() if self.instance else None
 
         self.root.title("Keep/Delete Media Sorter")
         self.root.geometry("1200x800")
@@ -148,6 +159,10 @@ class MediaSorterApp:
             )
 
     def display_video(self, path: Path) -> None:
+        if not self.player:
+            self.display_video_preview(path)
+            return
+
         self.canvas.update_idletasks()
         handle = self.canvas.winfo_id()
 
@@ -178,6 +193,46 @@ class MediaSorterApp:
             text=path.name,
         )
 
+    def display_video_preview(self, path: Path) -> None:
+        frame = self.read_first_video_frame(path)
+        if frame is None:
+            self.canvas.create_text(
+                20,
+                20,
+                anchor="nw",
+                fill="red",
+                font=("Arial", 12, "bold"),
+                text=f"Failed to load video preview: {path.name}",
+            )
+            return
+
+        canvas_w = max(self.canvas.winfo_width(), 1)
+        canvas_h = max(self.canvas.winfo_height(), 1)
+        frame.thumbnail((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+        self.current_photo = ImageTk.PhotoImage(frame)
+        self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo)
+        self.canvas.create_text(
+            10,
+            10,
+            anchor="nw",
+            fill="white",
+            font=("Arial", 11, "bold"),
+            text=f"{path.name} (preview only)",
+        )
+
+    @staticmethod
+    def read_first_video_frame(path: Path) -> Image.Image | None:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return None
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return None
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb_frame)
+
     @staticmethod
     def get_video_fps(path: Path) -> float:
         cap = cv2.VideoCapture(str(path))
@@ -188,6 +243,8 @@ class MediaSorterApp:
         return fps or 0.0
 
     def stop_video(self) -> None:
+        if not self.player:
+            return
         try:
             if self.player.is_playing():
                 self.player.stop()
